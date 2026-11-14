@@ -35,10 +35,11 @@
     if (fileExists && [self checkSHA:sha forFile:path altName:altName]) {
         if (success) success();
         return nil;
-    } else if (![self checkAccessWithDialog:YES]) {
-        return nil;
     }
 
+    // Allow downloading and installing Minecraft resources without requiring
+    // a Microsoft/Xbox account. Online authentication remains available for
+    // features and servers that require a licensed account.
     NSString *name = altName ?: path.lastPathComponent;
     NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:url]];
     __block NSProgress *progress;
@@ -217,6 +218,154 @@
             path = [NSString stringWithFormat:@"%s/resources/%@", getenv("POJAV_GAME_DIR"), name];
         } else {
             path = [NSString stringWithFormat:@"%s/assets/objects/%@", getenv("POJAV_GAME_DIR"), pathname];
+        }
+
+        /* Special case for 1.19+
+         * Since 1.19-pre1, setting the window icon on macOS invokes ObjC.
+         * However, if an IOException occurs, it won't try to set.
+         * We skip downloading the icon file to workaround this. */
+        if ([name hasSuffix:@"/minecraft.icns"]) {
+            [NSFileManager.defaultManager removeItemAtPath:path error:nil];
+            continue;
+        }
+
+        NSString *url = [NSString stringWithFormat:@"https://resources.download.minecraft.net/%@", pathname];
+        NSURLSessionDownloadTask *task = [self createDownloadTask:url size:size sha:hash altName:name toPath:path success:nil];
+        if (task) {
+            [tasks addObject:task];
+        } else if (self.progress.cancelled) {
+            return nil;
+        }
+    }
+    return tasks;
+}
+
+- (void)downloadVersion:(NSDictionary *)version {
+    [self prepareForDownload];
+    [self downloadVersionMetadata:version success:^{
+        [self downloadAssetMetadataWithSuccess:^{
+            NSArray *libTasks = [self downloadClientLibraries];
+            NSArray *assetTasks = [self downloadClientAssets];
+            // Drop the 1 byte we set initially
+            self.progress.totalUnitCount--;
+            self.textProgress.totalUnitCount--;
+            if (self.progress.totalUnitCount == 0) {
+                // We have nothing to download, invoke completion observer
+                self.progress.totalUnitCount = 1;
+                self.progress.completedUnitCount = 1;
+                self.textProgress.totalUnitCount = 1;
+                self.textProgress.completedUnitCount = 1;
+                return;
+            }
+            [libTasks makeObjectsPerformSelector:@selector(resume)];
+            [assetTasks makeObjectsPerformSelector:@selector(resume)];
+            [self.metadata removeObjectForKey:@"assetIndexObj"];
+        }];
+    }];
+}
+
+#pragma mark - Modpack installation
+
+- (void)downloadModpackFromAPI:(ModpackAPI *)api detail:(NSDictionary *)modDetail atIndex:(NSUInteger)selectedVersion {
+    [self prepareForDownload];
+
+    NSString *url = modDetail[@"versionUrls"][selectedVersion];
+    NSUInteger size = [modDetail[@"versionSizes"][selectedVersion] unsignedLongLongValue];
+    NSString *sha = modDetail[@"versionHashes"][selectedVersion];
+    NSString *name = [[modDetail[@"title"] lowercaseString] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    name = [name stringByReplacingOccurrencesOfString:@" " withString:@"_"];
+    NSString *packagePath = [NSTemporaryDirectory() stringByAppendingFormat:@"/%@.zip", name];
+
+    NSURLSessionDownloadTask *task = [self createDownloadTask:url size:size sha:sha altName:nil toPath:packagePath success:^{
+        NSString *path = [NSString stringWithFormat:@"%s/custom_gamedir/%@", getenv("POJAV_GAME_DIR"), name];
+        [api downloader:self submitDownloadTasksFromPackage:packagePath toPath:path];
+    }];
+    [task resume];
+}
+
+#pragma mark - Utilities
+
+- (void)prepareForDownload {
+    // Create a fake progress which is used to update completedUnitCount properly
+    // (completedUnitCount does not update unless subprogress completes)
+    self.textProgress = [NSProgress new];
+    self.textProgress.kind = NSProgressKindFile;
+    self.textProgress.fileOperationKind = NSProgressFileOperationKindDownloading;
+    self.textProgress.totalUnitCount = -1;
+
+    self.progress = [NSProgress new];
+    // Push 1 byte so it won't accidentally finish after downloading assets index
+    self.progress.totalUnitCount = 1;
+    [self.fileList removeAllObjects];
+    [self.progressList removeAllObjects];
+}
+
+- (void)finishDownloadWithErrorString:(NSString *)error {
+    [self.progress cancel];
+    [self.manager invalidateSessionCancelingTasks:YES resetSession:YES];
+    showDialog(localize(@"Error", nil), error);
+    self.handleError();
+}
+
+- (void)finishDownloadWithError:(NSError *)error file:(NSString *)file {
+    NSString *errorStr = [NSString stringWithFormat:localize(@"launcher.mcl.error_download", NULL), file, error.localizedDescription];
+    NSLog(@"[MCDL] Error: %@ %@", errorStr, NSThread.callStackSymbols);
+    [self finishDownloadWithErrorString:errorStr];
+}
+
+// Account authentication is not required to download/install game files.
+// Keep this method permissive for any remaining callers.
+- (BOOL)checkAccessWithDialog:(BOOL)show {
+    return YES;
+}
+
+// Check SHA of the file
+- (BOOL)checkSHAIgnorePref:(NSString *)sha forFile:(NSString *)path altName:(NSString *)altName logSuccess:(BOOL)logSuccess {
+    if (sha.length == 0) {
+        // When sha = skip, only check for file existence
+        BOOL existence = [NSFileManager.defaultManager fileExistsAtPath:path];
+        if (existence) {
+            NSLog(@"[MCDL] Warning: couldn't find SHA for %@, have to assume it's good.", path);
+        }
+        return existence;
+    }
+
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (data == nil) {
+        NSLog(@"[MCDL] SHA1 checker: file doesn't exist: %@", altName ? altName : path.lastPathComponent);
+        return NO;
+    }
+
+    unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1(data.bytes, (CC_LONG)data.length, digest);
+    NSMutableString *localSHA = [NSMutableString stringWithCapacity:CC_SHA1_DIGEST_LENGTH * 2];
+    for(int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++) {
+        [localSHA appendFormat:@"%02x", digest[i]];
+    }
+
+    BOOL check = [sha isEqualToString:localSHA];
+    if (!check || (getPrefBool(@"general.debug_logging") && logSuccess)) {
+        NSLog(@"[MCDL] SHA1 %@ for %@%@",
+          (check ? @"passed" : @"failed"), 
+          (altName ? altName : path.lastPathComponent),
+          (check ? @"" : [NSString stringWithFormat:@" (expected: %@, got: %@)", sha, localSHA]));
+    }
+    return check;
+}
+
+- (BOOL)checkSHA:(NSString *)sha forFile:(NSString *)path altName:(NSString *)altName logSuccess:(BOOL)logSuccess {
+    if (getPrefBool(@"general.check_sha")) {
+        return [self checkSHAIgnorePref:sha forFile:path altName:altName logSuccess:logSuccess];
+    } else {
+        return [NSFileManager.defaultManager fileExistsAtPath:path];
+    }
+}
+
+- (BOOL)checkSHA:(NSString *)sha forFile:(NSString *)path altName:(NSString *)altName {
+    return [self checkSHA:sha forFile:path altName:altName logSuccess:altName==nil];
+}
+
+@endrmat:@"%s/assets/objects/%@", getenv("POJAV_GAME_DIR"), pathname];
         }
 
         /* Special case for 1.19+
