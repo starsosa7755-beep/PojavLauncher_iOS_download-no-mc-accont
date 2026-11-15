@@ -34,23 +34,22 @@ jobs:
 
       - name: Get JRE 8
         run: |
-          mkdir -p JavaApp/src/main/resources/runtimes
-          wget -q https://github.com -O jre8.tar.xz
           mkdir -p JavaApp/src/main/resources/runtimes/8
+          wget -q "PUT_DIRECT_JRE_8_URL_HERE" -O jre8.tar.xz
           tar -xf jre8.tar.xz -C JavaApp/src/main/resources/runtimes/8
           rm jre8.tar.xz
 
       - name: Get JRE 17
         run: |
-          wget -q https://github.com -O jre17.tar.xz
           mkdir -p JavaApp/src/main/resources/runtimes/17
+          wget -q "PUT_DIRECT_JRE_17_URL_HERE" -O jre17.tar.xz
           tar -xf jre17.tar.xz -C JavaApp/src/main/resources/runtimes/17
           rm jre17.tar.xz
 
       - name: Get JRE 21
         run: |
-          wget -q https://github.com -O jre21.tar.xz
           mkdir -p JavaApp/src/main/resources/runtimes/21
+          wget -q "PUT_DIRECT_JRE_21_URL_HERE" -O jre21.tar.xz
           tar -xf jre21.tar.xz -C JavaApp/src/main/resources/runtimes/21
           rm jre21.tar.xz
 
